@@ -20,7 +20,8 @@ app.use(express.json());
 
 // SSE Connection Endpoint (GET)
 app.get('/sse', async (req, res) => {
-  const sessionId = req.query.session || `session-${Date.now()}`;
+  const sessionId =
+    req.query.sessionId || req.query.session || `session-${Date.now()}`;
   
   console.log('='.repeat(80));
   console.log(`[SSE GET] New connection`);
@@ -38,21 +39,11 @@ app.get('/sse', async (req, res) => {
 
   // CRITICAL: Send endpoint event first!
   // This tells the client where to POST messages
-  const protocol = req.get('x-forwarded-proto') || 'https';
-  const host = req.get('host');
-  const endpointUrl = `${protocol}://${host}/sse`;
-  
-  const endpointEvent = {
-    jsonrpc: '2.0',
-    method: 'endpoint',
-    params: {
-      uri: endpointUrl
-    }
-  };
-  
-  console.log(`[SSE GET] Sending endpoint event:`, JSON.stringify(endpointEvent));
-  res.write(`data: ${JSON.stringify(endpointEvent)}\n\n`);
-  console.log(`[SSE GET] Endpoint event sent!`);
+  const messagePath = `/sse?sessionId=${encodeURIComponent(sessionId)}`;
+
+  console.log(`[SSE GET] Sending endpoint path: ${messagePath}`);
+  res.write(`data: ${messagePath}\n\n`);
+  console.log(`[SSE GET] Endpoint path sent!`);
 
   // Keep-alive
   const keepAliveInterval = setInterval(() => {
@@ -79,7 +70,11 @@ app.post('/sse', async (req, res) => {
   console.log(`[SSE POST] Headers:`, JSON.stringify(req.headers, null, 2));
   console.log(`[SSE POST] Body:`, JSON.stringify(req.body, null, 2));
   
-  const sessionId = req.query.session || req.headers['x-session-id'] || 'default';
+  const sessionId =
+    req.query.sessionId ||
+    req.query.session ||
+    req.headers['x-session-id'] ||
+    'default';
   console.log(`[SSE POST] Session: ${sessionId}`);
   
   try {
