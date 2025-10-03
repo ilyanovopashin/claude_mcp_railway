@@ -6,20 +6,27 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT || 
-  'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
+  'https://admin.chatme.ai/connector/webim/webim_message/a7e28b914256ab13395ec974e7bb9548/bot_api_webhook';
 
 const connections = new Map();
 
 app.use(cors());
 app.use(express.json());
 
-// Main SSE endpoint
+// IMPORTANT: MCP SSE Transport requires:
+// 1. GET endpoint for SSE connection
+// 2. Server sends "endpoint" event with POST URL
+// 3. Client uses that POST URL for all requests
+
+// SSE Connection Endpoint (GET)
 app.get('/sse', async (req, res) => {
   const sessionId = req.query.session || `session-${Date.now()}`;
   
-  console.log(`========================================`);
-  console.log(`[SSE] New connection: ${sessionId}`);
-  console.log(`[SSE] Time: ${new Date().toISOString()}`);
+  console.log('='.repeat(80));
+  console.log(`[SSE GET] New connection`);
+  console.log(`[SSE GET] Session: ${sessionId}`);
+  console.log(`[SSE GET] Time: ${new Date().toISOString()}`);
+  console.log(`[SSE GET] Host: ${req.get('host')}`);
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -27,166 +34,60 @@ app.get('/sse', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
 
   connections.set(sessionId, res);
-  console.log(`[SSE] Active connections: ${connections.size}`);
+  console.log(`[SSE GET] Stored connection. Active: ${connections.size}`);
 
-  // Test different message formats to see what n8n accepts
-  const testFormats = async () => {
-    try {
-      console.log(`[SSE] Testing different SSE message formats...`);
-      
-      // Format 1: Simple ping
-      console.log(`[SSE FORMAT 1] Sending simple ping`);
-      res.write(`:ping\n\n`);
-      console.log(`[SSE FORMAT 1] ✓ Sent`);
-      
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Format 2: Named event
-      console.log(`[SSE FORMAT 2] Sending named event`);
-      res.write(`event: message\ndata: {"type":"test"}\n\n`);
-      console.log(`[SSE FORMAT 2] ✓ Sent`);
-      
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Format 3: Just data
-      console.log(`[SSE FORMAT 3] Sending just data`);
-      res.write(`data: {"test": true}\n\n`);
-      console.log(`[SSE FORMAT 3] ✓ Sent`);
-      
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Now fetch and send actual tools
-      console.log(`[SSE] Auto-fetching tools from Chatmi...`);
-      
-      const toolsRequest = {
-        method: 'tools/list',
-        params: {},
-        id: 'init-tools-list'
-      };
-      
-      const inputString = JSON.stringify(toolsRequest);
-      console.log(`[Chatmi] Requesting: ${inputString}`);
-
-      const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'new_message',
-          chat: { id: sessionId },
-          text: inputString
-        })
-      });
-
-      console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
-
-      if (chatmiResponse.ok) {
-        const chatmiData = await chatmiResponse.json();
-        console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
-        
-        if (chatmiData.has_answer && chatmiData.messages.length > 0) {
-          const outputString = chatmiData.messages[0].text;
-          console.log(`[Chatmi] Output string: ${outputString}`);
-          
-          try {
-            const result = JSON.parse(outputString);
-            console.log(`[Chatmi] Parsed result:`, JSON.stringify(result, null, 2));
-            
-            // Try different response formats
-            
-            // Format A: Standard MCP response
-            const formatA = {
-              jsonrpc: '2.0',
-              id: 'init-tools-list',
-              result: result
-            };
-            console.log(`[SSE FORMAT A] Sending standard MCP response:`);
-            console.log(JSON.stringify(formatA, null, 2));
-            const messageA = `data: ${JSON.stringify(formatA)}\n\n`;
-            console.log(`[SSE FORMAT A] Raw message: ${JSON.stringify(messageA)}`);
-            res.write(messageA);
-            console.log(`[SSE FORMAT A] ✓ Sent`);
-            
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            // Format B: Direct tools object
-            console.log(`[SSE FORMAT B] Sending direct tools object:`);
-            console.log(JSON.stringify(result, null, 2));
-            const messageB = `data: ${JSON.stringify(result)}\n\n`;
-            console.log(`[SSE FORMAT B] Raw message: ${JSON.stringify(messageB)}`);
-            res.write(messageB);
-            console.log(`[SSE FORMAT B] ✓ Sent`);
-            
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            // Format C: Named event with tools
-            console.log(`[SSE FORMAT C] Sending as named event 'tools'`);
-            const messageC = `event: tools\ndata: ${JSON.stringify(result)}\n\n`;
-            console.log(`[SSE FORMAT C] Raw message: ${JSON.stringify(messageC)}`);
-            res.write(messageC);
-            console.log(`[SSE FORMAT C] ✓ Sent`);
-            
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            // Format D: Method notification format
-            const formatD = {
-              jsonrpc: '2.0',
-              method: 'tools/list',
-              params: result
-            };
-            console.log(`[SSE FORMAT D] Sending as method notification:`);
-            console.log(JSON.stringify(formatD, null, 2));
-            const messageD = `data: ${JSON.stringify(formatD)}\n\n`;
-            console.log(`[SSE FORMAT D] Raw message: ${JSON.stringify(messageD)}`);
-            res.write(messageD);
-            console.log(`[SSE FORMAT D] ✓ Sent`);
-            
-            console.log(`[SSE] All formats sent. Check n8n to see which one works!`);
-            
-          } catch (parseError) {
-            console.error(`[Chatmi] Parse error:`, parseError);
-            console.error(`[Chatmi] Failed to parse: ${outputString}`);
-          }
-        } else {
-          console.error(`[Chatmi] No answer or empty messages`);
-        }
-      } else {
-        const errorText = await chatmiResponse.text();
-        console.error(`[Chatmi] HTTP error ${chatmiResponse.status}: ${errorText}`);
-      }
-    } catch (error) {
-      console.error(`[SSE] Error in testFormats:`, error);
-      console.error(`[SSE] Error stack:`, error.stack);
+  // CRITICAL: Send endpoint event first!
+  // This tells the client where to POST messages
+  const protocol = req.get('x-forwarded-proto') || 'https';
+  const host = req.get('host');
+  const endpointUrl = `${protocol}://${host}/sse`;
+  
+  const endpointEvent = {
+    jsonrpc: '2.0',
+    method: 'endpoint',
+    params: {
+      uri: endpointUrl
     }
   };
   
-  testFormats();
+  console.log(`[SSE GET] Sending endpoint event:`, JSON.stringify(endpointEvent));
+  res.write(`data: ${JSON.stringify(endpointEvent)}\n\n`);
+  console.log(`[SSE GET] Endpoint event sent!`);
 
   // Keep-alive
   const keepAliveInterval = setInterval(() => {
-    res.write(':ping\n\n');
+    try {
+      res.write(':ping\n\n');
+    } catch (error) {
+      console.error(`[SSE GET] Keep-alive error:`, error);
+      clearInterval(keepAliveInterval);
+    }
   }, 30000);
 
   req.on('close', () => {
-    console.log(`[SSE] Disconnected: ${sessionId}`);
+    console.log(`[SSE GET] Connection closed: ${sessionId}`);
     clearInterval(keepAliveInterval);
     connections.delete(sessionId);
   });
 });
 
-// Handle POST requests to /sse (for when n8n calls tools)
+// Message Endpoint (POST) - This is where client sends requests
 app.post('/sse', async (req, res) => {
-  console.log(`========================================`);
-  console.log(`[POST /sse] Request received`);
-  console.log(`[POST /sse] Body:`, JSON.stringify(req.body, null, 2));
+  console.log('='.repeat(80));
+  console.log(`[SSE POST] Message received`);
+  console.log(`[SSE POST] Time: ${new Date().toISOString()}`);
+  console.log(`[SSE POST] Headers:`, JSON.stringify(req.headers, null, 2));
+  console.log(`[SSE POST] Body:`, JSON.stringify(req.body, null, 2));
   
   const sessionId = req.query.session || req.headers['x-session-id'] || 'default';
-  console.log(`[POST /sse] Session: ${sessionId}`);
+  console.log(`[SSE POST] Session: ${sessionId}`);
   
   try {
     const mcpRequest = req.body;
 
-    if (!mcpRequest || mcpRequest.jsonrpc !== '2.0' || !mcpRequest.method) {
-      console.error(`[POST /sse] Invalid request format`);
+    // Validate JSON-RPC
+    if (!mcpRequest || mcpRequest.jsonrpc !== '2.0') {
+      console.error(`[SSE POST] Invalid JSON-RPC format`);
       return res.status(400).json({
         jsonrpc: '2.0',
         id: mcpRequest?.id || null,
@@ -194,17 +95,51 @@ app.post('/sse', async (req, res) => {
       });
     }
 
-    console.log(`[MCP] Method: ${mcpRequest.method}`);
-    console.log(`[MCP] Params:`, mcpRequest.params);
+    console.log(`[SSE POST] Method: ${mcpRequest.method}`);
+    console.log(`[SSE POST] ID: ${mcpRequest.id}`);
 
-    // Convert to Chatmi format
+    // Handle initialize specially
+    if (mcpRequest.method === 'initialize') {
+      console.log(`[SSE POST] Handling initialize request`);
+      const initResponse = {
+        jsonrpc: '2.0',
+        id: mcpRequest.id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: 'chatmi-mcp-server',
+            version: '1.0.0'
+          }
+        }
+      };
+      
+      console.log(`[SSE POST] Sending initialize response:`, JSON.stringify(initResponse, null, 2));
+      
+      // Check if client wants SSE response
+      const acceptHeader = req.get('accept') || '';
+      if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
+        console.log(`[SSE POST] Sending via SSE`);
+        connections.get(sessionId).write(`data: ${JSON.stringify(initResponse)}\n\n`);
+        return res.status(202).json({ status: 'sent via SSE' });
+      }
+      
+      console.log(`[SSE POST] Sending via HTTP`);
+      return res.json(initResponse);
+    }
+
+    // For all other methods, forward to Chatmi
+    console.log(`[SSE POST] Forwarding to Chatmi...`);
+    
     const inputString = JSON.stringify({
       method: mcpRequest.method,
       params: mcpRequest.params || {},
       id: mcpRequest.id
     });
 
-    console.log(`[Chatmi] Sending: ${inputString}`);
+    console.log(`[Chatmi] Request: ${inputString}`);
 
     const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
       method: 'POST',
@@ -219,7 +154,9 @@ app.post('/sse', async (req, res) => {
     console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
 
     if (!chatmiResponse.ok) {
-      throw new Error(`Chatmi HTTP ${chatmiResponse.status}`);
+      const errorText = await chatmiResponse.text();
+      console.error(`[Chatmi] Error: ${errorText}`);
+      throw new Error(`Chatmi HTTP ${chatmiResponse.status}: ${errorText}`);
     }
 
     const chatmiData = await chatmiResponse.json();
@@ -235,8 +172,10 @@ app.post('/sse', async (req, res) => {
     let result;
     try {
       result = JSON.parse(outputString);
-    } catch {
-      result = outputString;
+      console.log(`[Chatmi] Parsed:`, JSON.stringify(result, null, 2));
+    } catch (parseError) {
+      console.error(`[Chatmi] Parse error:`, parseError);
+      result = { text: outputString };
     }
 
     const mcpResponse = {
@@ -245,21 +184,24 @@ app.post('/sse', async (req, res) => {
       result
     };
 
-    console.log(`[MCP] Response:`, JSON.stringify(mcpResponse, null, 2));
+    console.log(`[SSE POST] MCP Response:`, JSON.stringify(mcpResponse, null, 2));
 
-    // Try to send via SSE first
-    if (connections.has(sessionId)) {
-      console.log(`[MCP] Sending via SSE to session: ${sessionId}`);
+    // Check if client wants SSE response
+    const acceptHeader = req.get('accept') || '';
+    console.log(`[SSE POST] Accept header: ${acceptHeader}`);
+    
+    if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
+      console.log(`[SSE POST] Sending response via SSE to session: ${sessionId}`);
       connections.get(sessionId).write(`data: ${JSON.stringify(mcpResponse)}\n\n`);
       return res.status(202).json({ status: 'sent via SSE', sessionId });
     }
 
-    // Fallback to direct HTTP response
-    console.log(`[MCP] No SSE connection, sending via HTTP`);
+    console.log(`[SSE POST] Sending response via HTTP`);
     return res.json(mcpResponse);
     
   } catch (error) {
-    console.error(`[Error]`, error);
+    console.error(`[SSE POST] Error:`, error);
+    console.error(`[SSE POST] Stack:`, error.stack);
     return res.status(500).json({
       jsonrpc: '2.0',
       id: req.body?.id || null,
@@ -276,14 +218,15 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     connections: connections.size,
     sessions: Array.from(connections.keys()),
-    chatmi: CHATMI_ENDPOINT ? 'configured' : 'default'
+    chatmi: CHATMI_ENDPOINT ? 'configured' : 'default',
+    timestamp: new Date().toISOString()
   });
 });
 
-// Test Chatmi
+// Test Chatmi connectivity
 app.post('/test/chatmi', async (req, res) => {
   try {
-    console.log(`[Test] Testing Chatmi...`);
+    console.log('[Test] Testing Chatmi connection...');
     
     const testPayload = {
       event: 'new_message',
@@ -295,7 +238,7 @@ app.post('/test/chatmi', async (req, res) => {
       })
     };
     
-    console.log(`[Test] Payload:`, testPayload);
+    console.log('[Test] Sending:', testPayload);
     
     const response = await fetch(CHATMI_ENDPOINT, {
       method: 'POST',
@@ -303,18 +246,29 @@ app.post('/test/chatmi', async (req, res) => {
       body: JSON.stringify(testPayload)
     });
     
-    console.log(`[Test] Status:`, response.status);
+    console.log('[Test] Status:', response.status);
     
     const data = await response.json();
-    console.log(`[Test] Response:`, data);
+    console.log('[Test] Response:', data);
+    
+    // Try to parse the text field
+    let parsedText = null;
+    if (data.has_answer && data.messages && data.messages[0]) {
+      try {
+        parsedText = JSON.parse(data.messages[0].text);
+      } catch (e) {
+        parsedText = data.messages[0].text;
+      }
+    }
     
     res.json({ 
-      success: true, 
+      success: true,
       chatmiEndpoint: CHATMI_ENDPOINT,
-      response: data 
+      rawResponse: data,
+      parsedTools: parsedText
     });
   } catch (error) {
-    console.error(`[Test] Error:`, error);
+    console.error('[Test] Error:', error);
     res.status(500).json({ 
       success: false, 
       error: error.message,
@@ -323,34 +277,15 @@ app.post('/test/chatmi', async (req, res) => {
   }
 });
 
-// Test what n8n sends
-app.all('/debug', express.json(), (req, res) => {
-  console.log('='.repeat(60));
-  console.log('[DEBUG] Request received');
-  console.log('[DEBUG] Method:', req.method);
-  console.log('[DEBUG] URL:', req.url);
-  console.log('[DEBUG] Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('[DEBUG] Body:', JSON.stringify(req.body, null, 2));
-  console.log('='.repeat(60));
-  
-  res.json({
-    received: {
-      method: req.method,
-      url: req.url,
-      headers: req.headers,
-      body: req.body
-    }
-  });
-});
-
 app.listen(PORT, () => {
-  console.log('='.repeat(60));
-  console.log(`🚀 MCP-Chatmi Server`);
+  console.log('='.repeat(80));
+  console.log(`🚀 MCP-Chatmi Proxy Server`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`🔌 SSE Endpoint: /sse`);
+  console.log(`   - GET /sse   → Open SSE connection`);
+  console.log(`   - POST /sse  → Send MCP messages`);
   console.log(`❤️  Health: /health`);
-  console.log(`🧪 Test Chatmi: POST /test/chatmi`);
-  console.log(`🐛 Debug: /debug`);
+  console.log(`🧪 Test: POST /test/chatmi`);
   console.log(`🔧 Chatmi: ${CHATMI_ENDPOINT}`);
-  console.log('='.repeat(60));
+  console.log('='.repeat(80));
 });
