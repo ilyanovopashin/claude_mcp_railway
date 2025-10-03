@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,6 +10,31 @@ const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT ||
   'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
 const connections = new Map();
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const extractSessionId = req =>
+  req.query.sessionId || req.query.session || req.headers['x-session-id'];
+
+const ensureSessionId = (req, { createIfMissing = false, context = 'session' } = {}) => {
+  const provided = extractSessionId(req);
+
+  if (provided) {
+    if (UUID_REGEX.test(provided)) {
+      return provided;
+    }
+
+    console.warn(`[${context}] Ignoring non-UUID session id: ${provided}`);
+  }
+
+  if (!createIfMissing) {
+    return null;
+  }
+
+  const generated = randomUUID();
+  console.log(`[${context}] Generated new session id: ${generated}`);
+  return generated;
+};
 
 app.use(cors());
 app.use(express.json());
@@ -20,8 +46,10 @@ app.use(express.json());
 
 // SSE Connection Endpoint (GET)
 app.get('/sse', async (req, res) => {
-  const sessionId =
-    req.query.sessionId || req.query.session || `session-${Date.now()}`;
+  const sessionId = ensureSessionId(req, {
+    createIfMissing: true,
+    context: 'sse'
+  });
   
   console.log('='.repeat(80));
   console.log(`[SSE GET] New connection`);
@@ -49,19 +77,8 @@ app.get('/sse', async (req, res) => {
   res.write(`event: endpoint\ndata: ${messagePath}\n\n`);
   console.log(`[SSE GET] Endpoint path sent!`);
 
-  // Keep-alive
-  const keepAliveInterval = setInterval(() => {
-    try {
-      res.write(':ping\n\n');
-    } catch (error) {
-      console.error(`[SSE GET] Keep-alive error:`, error);
-      clearInterval(keepAliveInterval);
-    }
-  }, 30000);
-
   req.on('close', () => {
     console.log(`[SSE GET] Connection closed: ${sessionId}`);
-    clearInterval(keepAliveInterval);
     connections.delete(sessionId);
   });
 });
@@ -74,11 +91,18 @@ const handleMcpMessage = async (req, res) => {
   console.log(`[MCP POST] Headers:`, JSON.stringify(req.headers, null, 2));
   console.log(`[MCP POST] Body:`, JSON.stringify(req.body, null, 2));
 
-  const sessionId =
-    req.query.sessionId ||
-    req.query.session ||
-    req.headers['x-session-id'] ||
-    'default';
+  const sessionId = ensureSessionId(req, { context: 'post' });
+  if (!sessionId) {
+    console.error('[MCP POST] Missing or invalid session id');
+    return res.status(400).json({
+      jsonrpc: '2.0',
+      id: req.body?.id || null,
+      error: {
+        code: -32602,
+        message: 'Missing or invalid sessionId (must be UUID)'
+      }
+    });
+  }
   console.log(`[MCP POST] Session: ${sessionId}`);
 
   try {
