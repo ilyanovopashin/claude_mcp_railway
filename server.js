@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT || 
-  '	https://webhook.site/680446d6-b95c-4170-8e17-680f18f3a5e0';
+  'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
 const connections = new Map();
 
