@@ -83,29 +83,57 @@ async function warmToolsList(sessionId) {
   }
 }
 
+function describeConnection(connection) {
+  return `writableEnded=${connection.writableEnded} writableFinished=${connection.writableFinished}`;
+}
+
+function logConnectionSnapshot() {
+  console.log(
+    `[SSE] Snapshot -> total=${connections.size} sessions=[${Array.from(
+      connections.keys()
+    ).join(', ') || 'none'}]`
+  );
+  for (const [session, connection] of connections.entries()) {
+    console.log(`  [SSE] Session ${session}: ${describeConnection(connection)}`);
+  }
+}
+
 function deliverMcpResponse(sessionId, response, res) {
   const payload = JSON.stringify(response);
+  console.log(`[MCP] Delivering response for id=${response.id} to session=${sessionId}`);
+  logConnectionSnapshot();
+
+  const writeToConnection = (targetSessionId, connection) => {
+    console.log(
+      `[MCP] -> session ${targetSessionId} (${describeConnection(connection)}) :: ${payload}`
+    );
+    if (!connection.writableEnded && !connection.destroyed) {
+      connection.write(`data: ${payload}\n\n`);
+    } else {
+      console.warn(`[MCP] Skipped session ${targetSessionId}; connection not writable`);
+    }
+  };
 
   if (sessionId && connections.has(sessionId)) {
-    console.log(`[MCP] Sending via SSE to session: ${sessionId}`);
-    connections.get(sessionId).write(`data: ${payload}\n\n`);
+    writeToConnection(sessionId, connections.get(sessionId));
   } else if (connections.size === 1) {
     const [onlySessionId, onlyConnection] = connections.entries().next().value;
     console.log(
       `[MCP] Session ${sessionId || 'default'} not found; broadcasting to ${onlySessionId}`
     );
-    onlyConnection.write(`data: ${payload}\n\n`);
+    writeToConnection(onlySessionId, onlyConnection);
   } else if (connections.size > 1) {
     console.log(
       `[MCP] Session ${sessionId || 'default'} not found; broadcasting to all ${connections.size} sessions`
     );
     for (const [connectedSessionId, connection] of connections.entries()) {
-      connection.write(`data: ${payload}\n\n`);
+      writeToConnection(connectedSessionId, connection);
     }
   } else {
     console.log(`[MCP] No SSE connection found for session: ${sessionId || 'default'}`);
   }
 
+  console.log(`[HTTP] Responding to POST /sse with: ${payload}`);
   return res.status(200).json(response);
 }
 
@@ -131,6 +159,7 @@ app.get('/sse', async (req, res) => {
   connections.set(sessionId, res);
   lastConnectedSessionId = sessionId;
   console.log(`[SSE] Active connections: ${connections.size}`);
+  logConnectionSnapshot();
 
   if (!isToolsListCacheValid()) {
     warmToolsList(sessionId);
@@ -149,6 +178,7 @@ app.get('/sse', async (req, res) => {
       const next = connections.keys().next().value;
       lastConnectedSessionId = next ?? null;
     }
+    logConnectionSnapshot();
   });
 });
 
