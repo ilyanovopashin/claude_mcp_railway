@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT || 
-  'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
+  'https://admin.chatme.ai/connector/webim/webim_message/a7e28b914256ab13395ec974e7bb9548/bot_api_webhook';
 
 const connections = new Map();
 
@@ -29,60 +29,137 @@ app.get('/sse', async (req, res) => {
   connections.set(sessionId, res);
   console.log(`[SSE] Active connections: ${connections.size}`);
 
-  // n8n expects the server to automatically fetch and send tools list
-  // So let's ask Chatmi for tools/list immediately
-  try {
-    console.log(`[SSE] Auto-fetching tools from Chatmi...`);
-    
-    const toolsRequest = {
-      method: 'tools/list',
-      params: {},
-      id: 'init-tools-list'
-    };
-    
-    const inputString = JSON.stringify(toolsRequest);
-    console.log(`[Chatmi] Requesting: ${inputString}`);
-
-    const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'new_message',
-        chat: { id: sessionId },
-        text: inputString
-      })
-    });
-
-    if (chatmiResponse.ok) {
-      const chatmiData = await chatmiResponse.json();
-      console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
+  // Test different message formats to see what n8n accepts
+  const testFormats = async () => {
+    try {
+      console.log(`[SSE] Testing different SSE message formats...`);
       
-      if (chatmiData.has_answer && chatmiData.messages.length > 0) {
-        const outputString = chatmiData.messages[0].text;
-        console.log(`[Chatmi] Output string: ${outputString}`);
+      // Format 1: Simple ping
+      console.log(`[SSE FORMAT 1] Sending simple ping`);
+      res.write(`:ping\n\n`);
+      console.log(`[SSE FORMAT 1] ✓ Sent`);
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Format 2: Named event
+      console.log(`[SSE FORMAT 2] Sending named event`);
+      res.write(`event: message\ndata: {"type":"test"}\n\n`);
+      console.log(`[SSE FORMAT 2] ✓ Sent`);
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Format 3: Just data
+      console.log(`[SSE FORMAT 3] Sending just data`);
+      res.write(`data: {"test": true}\n\n`);
+      console.log(`[SSE FORMAT 3] ✓ Sent`);
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Now fetch and send actual tools
+      console.log(`[SSE] Auto-fetching tools from Chatmi...`);
+      
+      const toolsRequest = {
+        method: 'tools/list',
+        params: {},
+        id: 'init-tools-list'
+      };
+      
+      const inputString = JSON.stringify(toolsRequest);
+      console.log(`[Chatmi] Requesting: ${inputString}`);
+
+      const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'new_message',
+          chat: { id: sessionId },
+          text: inputString
+        })
+      });
+
+      console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
+
+      if (chatmiResponse.ok) {
+        const chatmiData = await chatmiResponse.json();
+        console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
         
-        try {
-          const result = JSON.parse(outputString);
+        if (chatmiData.has_answer && chatmiData.messages.length > 0) {
+          const outputString = chatmiData.messages[0].text;
+          console.log(`[Chatmi] Output string: ${outputString}`);
           
-          // Send tools list to n8n
-          const toolsResponse = {
-            jsonrpc: '2.0',
-            id: 'init-tools-list',
-            result: result
-          };
-          
-          console.log(`[SSE] Sending tools:`, JSON.stringify(toolsResponse, null, 2));
-          res.write(`data: ${JSON.stringify(toolsResponse)}\n\n`);
-        } catch (parseError) {
-          console.error(`[Chatmi] Parse error:`, parseError);
+          try {
+            const result = JSON.parse(outputString);
+            console.log(`[Chatmi] Parsed result:`, JSON.stringify(result, null, 2));
+            
+            // Try different response formats
+            
+            // Format A: Standard MCP response
+            const formatA = {
+              jsonrpc: '2.0',
+              id: 'init-tools-list',
+              result: result
+            };
+            console.log(`[SSE FORMAT A] Sending standard MCP response:`);
+            console.log(JSON.stringify(formatA, null, 2));
+            const messageA = `data: ${JSON.stringify(formatA)}\n\n`;
+            console.log(`[SSE FORMAT A] Raw message: ${JSON.stringify(messageA)}`);
+            res.write(messageA);
+            console.log(`[SSE FORMAT A] ✓ Sent`);
+            
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Format B: Direct tools object
+            console.log(`[SSE FORMAT B] Sending direct tools object:`);
+            console.log(JSON.stringify(result, null, 2));
+            const messageB = `data: ${JSON.stringify(result)}\n\n`;
+            console.log(`[SSE FORMAT B] Raw message: ${JSON.stringify(messageB)}`);
+            res.write(messageB);
+            console.log(`[SSE FORMAT B] ✓ Sent`);
+            
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Format C: Named event with tools
+            console.log(`[SSE FORMAT C] Sending as named event 'tools'`);
+            const messageC = `event: tools\ndata: ${JSON.stringify(result)}\n\n`;
+            console.log(`[SSE FORMAT C] Raw message: ${JSON.stringify(messageC)}`);
+            res.write(messageC);
+            console.log(`[SSE FORMAT C] ✓ Sent`);
+            
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Format D: Method notification format
+            const formatD = {
+              jsonrpc: '2.0',
+              method: 'tools/list',
+              params: result
+            };
+            console.log(`[SSE FORMAT D] Sending as method notification:`);
+            console.log(JSON.stringify(formatD, null, 2));
+            const messageD = `data: ${JSON.stringify(formatD)}\n\n`;
+            console.log(`[SSE FORMAT D] Raw message: ${JSON.stringify(messageD)}`);
+            res.write(messageD);
+            console.log(`[SSE FORMAT D] ✓ Sent`);
+            
+            console.log(`[SSE] All formats sent. Check n8n to see which one works!`);
+            
+          } catch (parseError) {
+            console.error(`[Chatmi] Parse error:`, parseError);
+            console.error(`[Chatmi] Failed to parse: ${outputString}`);
+          }
+        } else {
+          console.error(`[Chatmi] No answer or empty messages`);
         }
+      } else {
+        const errorText = await chatmiResponse.text();
+        console.error(`[Chatmi] HTTP error ${chatmiResponse.status}: ${errorText}`);
       }
-    } else {
-      console.error(`[Chatmi] HTTP error: ${chatmiResponse.status}`);
+    } catch (error) {
+      console.error(`[SSE] Error in testFormats:`, error);
+      console.error(`[SSE] Error stack:`, error.stack);
     }
-  } catch (error) {
-    console.error(`[SSE] Error fetching tools:`, error);
-  }
+  };
+  
+  testFormats();
 
   // Keep-alive
   const keepAliveInterval = setInterval(() => {
