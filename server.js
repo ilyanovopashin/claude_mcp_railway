@@ -9,6 +9,133 @@ const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT ||
   'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
 const connections = new Map();
+let lastConnectedSessionId = null;
+
+const chatmiToolsListCache = {
+  data: null,
+  timestamp: 0
+};
+
+const TOOLS_LIST_CACHE_TTL = 60 * 1000; // 1 minute cache TTL for tools list
+
+function isToolsListCacheValid() {
+  return (
+    chatmiToolsListCache.data !== null &&
+    Date.now() - chatmiToolsListCache.timestamp < TOOLS_LIST_CACHE_TTL
+  );
+}
+
+async function sendChatmiRequest(sessionId, method, params = {}, id = null) {
+  const chatmiPayload = {
+    method,
+    params,
+    id
+  };
+
+  const inputString = JSON.stringify(chatmiPayload);
+  console.log(`[Chatmi] Sending: ${inputString}`);
+
+  const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      event: 'new_message',
+      chat: { id: sessionId },
+      text: inputString
+    })
+  });
+
+  console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
+
+  if (!chatmiResponse.ok) {
+    throw new Error(`Chatmi HTTP ${chatmiResponse.status}`);
+  }
+
+  const chatmiData = await chatmiResponse.json();
+  console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
+
+  if (!chatmiData.has_answer || chatmiData.messages.length === 0) {
+    throw new Error('No response from Chatmi');
+  }
+
+  const outputString = chatmiData.messages[0].text;
+  console.log(`[Chatmi] Output: ${outputString}`);
+
+  let result;
+  try {
+    result = JSON.parse(outputString);
+  } catch {
+    result = outputString;
+  }
+
+  return result;
+}
+
+async function warmToolsList(sessionId) {
+  try {
+    console.log(`[Warmup] Refreshing tools list cache...`);
+    const result = await sendChatmiRequest(sessionId, 'tools/list', {}, 'warm-tools-list');
+    chatmiToolsListCache.data = result;
+    chatmiToolsListCache.timestamp = Date.now();
+    console.log(`[Warmup] Tools list cache updated`);
+  } catch (error) {
+    console.error(`[Warmup] Failed to refresh tools list cache:`, error);
+  }
+}
+
+function describeConnection(connection) {
+  return `writableEnded=${connection.writableEnded} writableFinished=${connection.writableFinished}`;
+}
+
+function logConnectionSnapshot() {
+  console.log(
+    `[SSE] Snapshot -> total=${connections.size} sessions=[${Array.from(
+      connections.keys()
+    ).join(', ') || 'none'}]`
+  );
+  for (const [session, connection] of connections.entries()) {
+    console.log(`  [SSE] Session ${session}: ${describeConnection(connection)}`);
+  }
+}
+
+function deliverMcpResponse(sessionId, response, res) {
+  const payload = JSON.stringify(response);
+  console.log(`[MCP] Delivering response for id=${response.id} to session=${sessionId}`);
+  logConnectionSnapshot();
+
+  const writeToConnection = (targetSessionId, connection) => {
+    console.log(
+      `[MCP] -> session ${targetSessionId} (${describeConnection(connection)}) :: ${payload}`
+    );
+    if (!connection.writableEnded && !connection.destroyed) {
+      connection.write(`data: ${payload}\n\n`);
+    } else {
+      console.warn(`[MCP] Skipped session ${targetSessionId}; connection not writable`);
+    }
+  };
+
+  if (sessionId && connections.has(sessionId)) {
+    writeToConnection(sessionId, connections.get(sessionId));
+  } else if (connections.size === 1) {
+    const [onlySessionId, onlyConnection] = connections.entries().next().value;
+    console.log(
+      `[MCP] Session ${sessionId || 'default'} not found; broadcasting to ${onlySessionId}`
+    );
+    writeToConnection(onlySessionId, onlyConnection);
+  } else if (connections.size > 1) {
+    console.log(
+      `[MCP] Session ${sessionId || 'default'} not found; broadcasting to all ${connections.size} sessions`
+    );
+    for (const [connectedSessionId, connection] of connections.entries()) {
+      writeToConnection(connectedSessionId, connection);
+    }
+  } else {
+    console.log(`[MCP] No SSE connection found for session: ${sessionId || 'default'}`);
+  }
+
+  console.log(`[HTTP] Responding to POST /sse with: ${payload}`);
+  return res.status(200).json(response);
+}
 
 app.use(cors());
 app.use(express.json());
@@ -25,63 +152,17 @@ app.get('/sse', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
 
   connections.set(sessionId, res);
+  lastConnectedSessionId = sessionId;
   console.log(`[SSE] Active connections: ${connections.size}`);
+  logConnectionSnapshot();
 
-  // n8n expects the server to automatically fetch and send tools list
-  // So let's ask Chatmi for tools/list immediately
-  try {
-    console.log(`[SSE] Auto-fetching tools from Chatmi...`);
-    
-    const toolsRequest = {
-      method: 'tools/list',
-      params: {},
-      id: 'init-tools-list'
-    };
-    
-    const inputString = JSON.stringify(toolsRequest);
-    console.log(`[Chatmi] Requesting: ${inputString}`);
-
-    const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'new_message',
-        chat: { id: sessionId },
-        text: inputString
-      })
-    });
-
-    if (chatmiResponse.ok) {
-      const chatmiData = await chatmiResponse.json();
-      console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
-      
-      if (chatmiData.has_answer && chatmiData.messages.length > 0) {
-        const outputString = chatmiData.messages[0].text;
-        console.log(`[Chatmi] Output string: ${outputString}`);
-        
-        try {
-          const result = JSON.parse(outputString);
-          
-          // Send tools list to n8n
-          const toolsResponse = {
-            jsonrpc: '2.0',
-            id: 'init-tools-list',
-            result: result
-          };
-          
-          console.log(`[SSE] Sending tools:`, JSON.stringify(toolsResponse, null, 2));
-          res.write(`data: ${JSON.stringify(toolsResponse)}\n\n`);
-        } catch (parseError) {
-          console.error(`[Chatmi] Parse error:`, parseError);
-        }
-      }
-    } else {
-      console.error(`[Chatmi] HTTP error: ${chatmiResponse.status}`);
-    }
-  } catch (error) {
-    console.error(`[SSE] Error fetching tools:`, error);
+  if (!isToolsListCacheValid()) {
+    warmToolsList(sessionId);
   }
 
   // Keep-alive
@@ -93,6 +174,11 @@ app.get('/sse', async (req, res) => {
     console.log(`[SSE] Disconnected: ${sessionId}`);
     clearInterval(keepAliveInterval);
     connections.delete(sessionId);
+    if (lastConnectedSessionId === sessionId) {
+      const next = connections.keys().next().value;
+      lastConnectedSessionId = next ?? null;
+    }
+    logConnectionSnapshot();
   });
 });
 
@@ -102,7 +188,14 @@ app.post('/sse', async (req, res) => {
   console.log(`[POST /sse] Request received`);
   console.log(`[POST /sse] Body:`, JSON.stringify(req.body, null, 2));
   
-  const sessionId = req.query.session || req.headers['x-session-id'] || 'default';
+  let sessionId = req.query.session || req.headers['x-session-id'];
+  if (!sessionId && connections.size === 1) {
+    sessionId = connections.keys().next().value;
+  }
+  if (!sessionId) {
+    sessionId = lastConnectedSessionId || 'default';
+  }
+
   console.log(`[POST /sse] Session: ${sessionId}`);
   
   try {
@@ -119,47 +212,30 @@ app.post('/sse', async (req, res) => {
 
     console.log(`[MCP] Method: ${mcpRequest.method}`);
     console.log(`[MCP] Params:`, mcpRequest.params);
+    if (mcpRequest.method === 'tools/list' && isToolsListCacheValid()) {
+      console.log(`[MCP] Serving tools list from cache`);
+      const cachedResponse = {
+        jsonrpc: '2.0',
+        id: mcpRequest.id,
+        result: chatmiToolsListCache.data
+      };
 
-    // Convert to Chatmi format
-    const inputString = JSON.stringify({
-      method: mcpRequest.method,
-      params: mcpRequest.params || {},
-      id: mcpRequest.id
-    });
-
-    console.log(`[Chatmi] Sending: ${inputString}`);
-
-    const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'new_message',
-        chat: { id: sessionId },
-        text: inputString
-      })
-    });
-
-    console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
-
-    if (!chatmiResponse.ok) {
-      throw new Error(`Chatmi HTTP ${chatmiResponse.status}`);
+      const delivery = deliverMcpResponse(sessionId, cachedResponse, res);
+      warmToolsList(sessionId);
+      return delivery;
     }
 
-    const chatmiData = await chatmiResponse.json();
-    console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
-    
-    if (!chatmiData.has_answer || chatmiData.messages.length === 0) {
-      throw new Error('No response from Chatmi');
-    }
+    const result = await sendChatmiRequest(
+      sessionId,
+      mcpRequest.method,
+      mcpRequest.params || {},
+      mcpRequest.id
+    );
 
-    const outputString = chatmiData.messages[0].text;
-    console.log(`[Chatmi] Output: ${outputString}`);
-
-    let result;
-    try {
-      result = JSON.parse(outputString);
-    } catch {
-      result = outputString;
+    if (mcpRequest.method === 'tools/list') {
+      chatmiToolsListCache.data = result;
+      chatmiToolsListCache.timestamp = Date.now();
+      console.log(`[MCP] Tools list cache updated`);
     }
 
     const mcpResponse = {
@@ -170,17 +246,8 @@ app.post('/sse', async (req, res) => {
 
     console.log(`[MCP] Response:`, JSON.stringify(mcpResponse, null, 2));
 
-    // Try to send via SSE first
-    if (connections.has(sessionId)) {
-      console.log(`[MCP] Sending via SSE to session: ${sessionId}`);
-      connections.get(sessionId).write(`data: ${JSON.stringify(mcpResponse)}\n\n`);
-      return res.status(202).json({ status: 'sent via SSE', sessionId });
-    }
+    return deliverMcpResponse(sessionId, mcpResponse, res);
 
-    // Fallback to direct HTTP response
-    console.log(`[MCP] No SSE connection, sending via HTTP`);
-    return res.json(mcpResponse);
-    
   } catch (error) {
     console.error(`[Error]`, error);
     return res.status(500).json({
