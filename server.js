@@ -285,11 +285,22 @@ function logConnectionSnapshot() {
   }
 }
 
-function deliverMcpResponse(sessionId, response, res) {
-  const payload = JSON.stringify(response);
+function deliverMcpResponse(sessionId, response, res, context = {}) {
+  const payloadEnvelope = {
+    type: 'response',
+    response
+  };
+  const payload = JSON.stringify(payloadEnvelope);
   mcpLogger.info('Delivering MCP response', {
     sessionId,
-    responseId: response.id
+    responseId: response.id,
+    requestMethod: context.requestMethod
+  });
+  mcpLogger.debug('Prepared SSE payload envelope', {
+    sessionId,
+    responseId: response.id,
+    requestMethod: context.requestMethod,
+    payload: payloadEnvelope
   });
   logConnectionSnapshot();
 
@@ -297,7 +308,7 @@ function deliverMcpResponse(sessionId, response, res) {
     mcpLogger.debug('Writing payload to connection', {
       targetSessionId,
       connectionState: describeConnection(connection),
-      payload: response
+      payload: payloadEnvelope
     });
     if (!connection.writableEnded && !connection.destroyed) {
       connection.write(`data: ${payload}\n\n`);
@@ -331,7 +342,11 @@ function deliverMcpResponse(sessionId, response, res) {
     });
   }
 
-  mcpLogger.info('Responding to HTTP POST /sse', { payload: response });
+  mcpLogger.info('Responding to HTTP POST /sse', {
+    sessionId,
+    responseId: response.id,
+    requestMethod: context.requestMethod
+  });
   return res.status(200).json(response);
 }
 
@@ -450,7 +465,15 @@ app.post('/sse', async (req, res) => {
         result: chatmiToolsListCache.data
       };
 
-      const delivery = deliverMcpResponse(sessionId, cachedResponse, res);
+      logger.info('Returning cached tools list to MCP client', {
+        sessionId,
+        toolCount: Array.isArray(chatmiToolsListCache.data?.tools)
+          ? chatmiToolsListCache.data.tools.length
+          : undefined
+      });
+      const delivery = deliverMcpResponse(sessionId, cachedResponse, res, {
+        requestMethod: mcpRequest.method
+      });
       triggerWarmToolsList(sessionId, 'serve-cached-tools-list');
       return delivery;
     }
@@ -469,6 +492,10 @@ app.post('/sse', async (req, res) => {
       logger.info('Tools list cache updated from MCP response', {
         cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString()
       });
+      logger.info('Returning tools list to MCP client', {
+        sessionId,
+        toolCount: Array.isArray(result?.tools) ? result.tools.length : undefined
+      });
     }
 
     const mcpResponse = {
@@ -477,9 +504,14 @@ app.post('/sse', async (req, res) => {
       result
     };
 
-    logger.debug('Generated MCP response', mcpResponse);
+    logger.debug('Generated MCP response', {
+      response: mcpResponse,
+      requestMethod: mcpRequest.method
+    });
 
-    return deliverMcpResponse(sessionId, mcpResponse, res);
+    return deliverMcpResponse(sessionId, mcpResponse, res, {
+      requestMethod: mcpRequest.method
+    });
 
   } catch (error) {
     logger.error('Failed to process MCP request', error);
