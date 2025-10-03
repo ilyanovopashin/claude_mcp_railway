@@ -45,6 +45,20 @@ app.use(express.json());
 // 3. Client uses that POST URL for all requests
 
 // SSE Connection Endpoint (GET)
+const sendSseEvent = (sessionId, event, data) => {
+  const connection = connections.get(sessionId);
+
+  if (!connection) {
+    console.warn(`[SSE] No active connection for session ${sessionId}`);
+    return false;
+  }
+
+  const payload = typeof data === 'string' ? data : JSON.stringify(data);
+  const eventLine = event ? `event: ${event}\n` : '';
+  connection.write(`${eventLine}data: ${payload}\n\n`);
+  return true;
+};
+
 app.get('/sse', async (req, res) => {
   const sessionId = ensureSessionId(req, {
     createIfMissing: true,
@@ -74,7 +88,7 @@ app.get('/sse', async (req, res) => {
   )}`;
 
   console.log(`[SSE GET] Sending endpoint path: ${messagePath}`);
-  res.write(`event: endpoint\ndata: ${messagePath}\n\n`);
+  sendSseEvent(sessionId, 'endpoint', messagePath);
   console.log(`[SSE GET] Endpoint path sent!`);
 
   req.on('close', () => {
@@ -142,14 +156,12 @@ const handleMcpMessage = async (req, res) => {
       console.log(`[MCP POST] Sending initialize response:`, JSON.stringify(initResponse, null, 2));
 
       // Check if client wants SSE response
-      const acceptHeader = req.get('accept') || '';
-      if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
-        console.log(`[MCP POST] Sending via SSE`);
-        connections.get(sessionId).write(`data: ${JSON.stringify(initResponse)}\n\n`);
+      if (sendSseEvent(sessionId, 'message', initResponse)) {
+        console.log(`[MCP POST] Initialize response sent via SSE to ${sessionId}`);
         return res.status(202).json({ status: 'sent via SSE' });
       }
 
-      console.log(`[MCP POST] Sending via HTTP`);
+      console.warn('[MCP POST] No SSE connection; falling back to HTTP response');
       return res.json(initResponse);
     }
 
@@ -210,29 +222,32 @@ const handleMcpMessage = async (req, res) => {
     console.log(`[MCP POST] MCP Response:`, JSON.stringify(mcpResponse, null, 2));
 
     // Check if client wants SSE response
-    const acceptHeader = req.get('accept') || '';
-    console.log(`[MCP POST] Accept header: ${acceptHeader}`);
-
-    if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
-      console.log(`[MCP POST] Sending response via SSE to session: ${sessionId}`);
-      connections.get(sessionId).write(`data: ${JSON.stringify(mcpResponse)}\n\n`);
+    if (sendSseEvent(sessionId, 'message', mcpResponse)) {
+      console.log(`[MCP POST] Response sent via SSE to session: ${sessionId}`);
       return res.status(202).json({ status: 'sent via SSE', sessionId });
     }
 
-    console.log(`[MCP POST] Sending response via HTTP`);
+    console.warn('[MCP POST] No SSE connection; falling back to HTTP response');
     return res.json(mcpResponse);
 
   } catch (error) {
     console.error(`[MCP POST] Error:`, error);
     console.error(`[MCP POST] Stack:`, error.stack);
-    return res.status(500).json({
+    const errorResponse = {
       jsonrpc: '2.0',
       id: req.body?.id || null,
       error: {
         code: -32603,
         message: error.message
       }
-    });
+    };
+
+    if (sendSseEvent(sessionId, 'error', errorResponse)) {
+      console.log(`[MCP POST] Error sent via SSE to session: ${sessionId}`);
+      return res.status(202).json({ status: 'error sent via SSE', sessionId });
+    }
+
+    return res.status(500).json(errorResponse);
   }
 };
 
