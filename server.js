@@ -216,6 +216,7 @@ async function warmToolsList(sessionId, reason) {
     reason,
     sessionId
   });
+  deliverCachedToolsList(sessionId, { reason: reason || 'warm-tools-list-refresh' });
 }
 
 function triggerWarmToolsList(sessionId, reason) {
@@ -285,12 +286,105 @@ function logConnectionSnapshot() {
   }
 }
 
+function writeSsePayload(sessionId, payloadEnvelope, context = {}) {
+  logConnectionSnapshot();
+  const payload = JSON.stringify(payloadEnvelope);
+
+  const writeToConnection = (targetSessionId, connection) => {
+    mcpLogger.debug('Writing payload to connection', {
+      targetSessionId,
+      connectionState: describeConnection(connection),
+      payload: payloadEnvelope,
+      requestMethod: context.requestMethod,
+      responseId: context.responseId,
+      deliveryReason: context.deliveryReason
+    });
+    if (!connection.writableEnded && !connection.writableFinished && !connection.destroyed) {
+      connection.write(`data: ${payload}\n\n`);
+    } else {
+      mcpLogger.warn('Skipped connection because it is not writable', {
+        targetSessionId,
+        requestMethod: context.requestMethod,
+        deliveryReason: context.deliveryReason
+      });
+    }
+  };
+
+  if (sessionId && connections.has(sessionId)) {
+    writeToConnection(sessionId, connections.get(sessionId));
+  } else if (connections.size === 1) {
+    const [onlySessionId, onlyConnection] = connections.entries().next().value;
+    mcpLogger.warn('Original session not found; broadcasting to single connection', {
+      requestedSession: sessionId,
+      fallbackSession: onlySessionId,
+      requestMethod: context.requestMethod,
+      deliveryReason: context.deliveryReason
+    });
+    writeToConnection(onlySessionId, onlyConnection);
+  } else if (connections.size > 1) {
+    mcpLogger.warn('Original session not found; broadcasting to all connections', {
+      requestedSession: sessionId,
+      activeConnections: connections.size,
+      requestMethod: context.requestMethod,
+      deliveryReason: context.deliveryReason
+    });
+    for (const [connectedSessionId, connection] of connections.entries()) {
+      writeToConnection(connectedSessionId, connection);
+    }
+  } else {
+    mcpLogger.warn('No SSE connection available for response delivery', {
+      requestedSession: sessionId,
+      requestMethod: context.requestMethod,
+      deliveryReason: context.deliveryReason
+    });
+  }
+}
+
+function deliverCachedToolsList(sessionId, context = {}) {
+  if (!isToolsListCacheValid()) {
+    mcpLogger.debug('Skipping cached tools list delivery; cache invalid', {
+      sessionId,
+      deliveryReason: context.reason
+    });
+    return;
+  }
+
+  const cachedResponse = {
+    jsonrpc: '2.0',
+    id: context.responseId || 'warm-tools-list',
+    result: chatmiToolsListCache.data
+  };
+  const payloadEnvelope = {
+    type: 'response',
+    response: cachedResponse
+  };
+
+  mcpLogger.info('Delivering cached tools list over SSE', {
+    sessionId,
+    requestMethod: 'tools/list',
+    deliveryReason: context.reason,
+    cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString()
+  });
+  mcpLogger.debug('Prepared cached tools list payload envelope', {
+    sessionId,
+    requestMethod: 'tools/list',
+    deliveryReason: context.reason,
+    responseId: cachedResponse.id,
+    payload: payloadEnvelope
+  });
+
+  writeSsePayload(sessionId, payloadEnvelope, {
+    requestMethod: 'tools/list',
+    responseId: cachedResponse.id,
+    deliveryReason: context.reason
+  });
+}
+
 function deliverMcpResponse(sessionId, response, res, context = {}) {
   const payloadEnvelope = {
     type: 'response',
     response
   };
-  const payload = JSON.stringify(payloadEnvelope);
   mcpLogger.info('Delivering MCP response', {
     sessionId,
     responseId: response.id,
@@ -302,45 +396,10 @@ function deliverMcpResponse(sessionId, response, res, context = {}) {
     requestMethod: context.requestMethod,
     payload: payloadEnvelope
   });
-  logConnectionSnapshot();
-
-  const writeToConnection = (targetSessionId, connection) => {
-    mcpLogger.debug('Writing payload to connection', {
-      targetSessionId,
-      connectionState: describeConnection(connection),
-      payload: payloadEnvelope
-    });
-    if (!connection.writableEnded && !connection.destroyed) {
-      connection.write(`data: ${payload}\n\n`);
-    } else {
-      mcpLogger.warn('Skipped connection because it is not writable', {
-        targetSessionId
-      });
-    }
-  };
-
-  if (sessionId && connections.has(sessionId)) {
-    writeToConnection(sessionId, connections.get(sessionId));
-  } else if (connections.size === 1) {
-    const [onlySessionId, onlyConnection] = connections.entries().next().value;
-    mcpLogger.warn('Original session not found; broadcasting to single connection', {
-      requestedSession: sessionId,
-      fallbackSession: onlySessionId
-    });
-    writeToConnection(onlySessionId, onlyConnection);
-  } else if (connections.size > 1) {
-    mcpLogger.warn('Original session not found; broadcasting to all connections', {
-      requestedSession: sessionId,
-      activeConnections: connections.size
-    });
-    for (const [connectedSessionId, connection] of connections.entries()) {
-      writeToConnection(connectedSessionId, connection);
-    }
-  } else {
-    mcpLogger.warn('No SSE connection available for response delivery', {
-      requestedSession: sessionId
-    });
-  }
+  writeSsePayload(sessionId, payloadEnvelope, {
+    requestMethod: context.requestMethod,
+    responseId: response.id
+  });
 
   mcpLogger.info('Responding to HTTP POST /sse', {
     sessionId,
@@ -396,6 +455,8 @@ app.get('/sse', async (req, res) => {
 
   if (!isToolsListCacheValid()) {
     triggerWarmToolsList(sessionId, 'sse-connection');
+  } else {
+    deliverCachedToolsList(sessionId, { reason: 'sse-connection-cache' });
   }
 
   // Keep-alive
