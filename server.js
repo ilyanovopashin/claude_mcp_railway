@@ -9,6 +9,105 @@ const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT ||
   'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
 const connections = new Map();
+let lastConnectedSessionId = null;
+
+const toolsListCache = {
+  data: null,
+  timestamp: 0
+};
+
+const TOOLS_LIST_CACHE_TTL = 60 * 1000; // 1 minute cache TTL for tools list
+
+function isToolsListCacheValid() {
+  return (
+    toolsListCache.data !== null &&
+    Date.now() - toolsListCache.timestamp < TOOLS_LIST_CACHE_TTL
+  );
+}
+
+async function sendChatmiRequest(sessionId, method, params = {}, id = null) {
+  const chatmiPayload = {
+    method,
+    params,
+    id
+  };
+
+  const inputString = JSON.stringify(chatmiPayload);
+  console.log(`[Chatmi] Sending: ${inputString}`);
+
+  const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      event: 'new_message',
+      chat: { id: sessionId },
+      text: inputString
+    })
+  });
+
+  console.log(`[Chatmi] Status: ${chatmiResponse.status}`);
+
+  if (!chatmiResponse.ok) {
+    throw new Error(`Chatmi HTTP ${chatmiResponse.status}`);
+  }
+
+  const chatmiData = await chatmiResponse.json();
+  console.log(`[Chatmi] Response:`, JSON.stringify(chatmiData, null, 2));
+
+  if (!chatmiData.has_answer || chatmiData.messages.length === 0) {
+    throw new Error('No response from Chatmi');
+  }
+
+  const outputString = chatmiData.messages[0].text;
+  console.log(`[Chatmi] Output: ${outputString}`);
+
+  let result;
+  try {
+    result = JSON.parse(outputString);
+  } catch {
+    result = outputString;
+  }
+
+  return result;
+}
+
+async function warmToolsList(sessionId) {
+  try {
+    console.log(`[Warmup] Refreshing tools list cache...`);
+    const result = await sendChatmiRequest(sessionId, 'tools/list', {}, 'warm-tools-list');
+    toolsListCache.data = result;
+    toolsListCache.timestamp = Date.now();
+    console.log(`[Warmup] Tools list cache updated`);
+  } catch (error) {
+    console.error(`[Warmup] Failed to refresh tools list cache:`, error);
+  }
+}
+
+function deliverMcpResponse(sessionId, response, res) {
+  const payload = JSON.stringify(response);
+
+  if (sessionId && connections.has(sessionId)) {
+    console.log(`[MCP] Sending via SSE to session: ${sessionId}`);
+    connections.get(sessionId).write(`data: ${payload}\n\n`);
+  } else if (connections.size === 1) {
+    const [onlySessionId, onlyConnection] = connections.entries().next().value;
+    console.log(
+      `[MCP] Session ${sessionId || 'default'} not found; broadcasting to ${onlySessionId}`
+    );
+    onlyConnection.write(`data: ${payload}\n\n`);
+  } else if (connections.size > 1) {
+    console.log(
+      `[MCP] Session ${sessionId || 'default'} not found; broadcasting to all ${connections.size} sessions`
+    );
+    for (const [connectedSessionId, connection] of connections.entries()) {
+      connection.write(`data: ${payload}\n\n`);
+    }
+  } else {
+    console.log(`[MCP] No SSE connection found for session: ${sessionId || 'default'}`);
+  }
+
+  return res.status(200).json(response);
+}
 
 const toolsListCache = {
   data: null,
@@ -117,6 +216,7 @@ app.get('/sse', async (req, res) => {
   }
 
   connections.set(sessionId, res);
+  lastConnectedSessionId = sessionId;
   console.log(`[SSE] Active connections: ${connections.size}`);
 
   if (!isToolsListCacheValid()) {
@@ -132,6 +232,10 @@ app.get('/sse', async (req, res) => {
     console.log(`[SSE] Disconnected: ${sessionId}`);
     clearInterval(keepAliveInterval);
     connections.delete(sessionId);
+    if (lastConnectedSessionId === sessionId) {
+      const next = connections.keys().next().value;
+      lastConnectedSessionId = next ?? null;
+    }
   });
 });
 
@@ -141,7 +245,14 @@ app.post('/sse', async (req, res) => {
   console.log(`[POST /sse] Request received`);
   console.log(`[POST /sse] Body:`, JSON.stringify(req.body, null, 2));
   
-  const sessionId = req.query.session || req.headers['x-session-id'] || 'default';
+  let sessionId = req.query.session || req.headers['x-session-id'];
+  if (!sessionId && connections.size === 1) {
+    sessionId = connections.keys().next().value;
+  }
+  if (!sessionId) {
+    sessionId = lastConnectedSessionId || 'default';
+  }
+
   console.log(`[POST /sse] Session: ${sessionId}`);
   
   try {
@@ -178,7 +289,6 @@ app.post('/sse', async (req, res) => {
       mcpRequest.params || {},
       mcpRequest.id
     );
-
 
     if (mcpRequest.method === 'tools/list') {
       toolsListCache.data = result;
