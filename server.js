@@ -83,6 +83,7 @@ async function warmToolsList(sessionId) {
 }
 
 function deliverMcpResponse(sessionId, response, res) {
+
   const payload = JSON.stringify(response);
 
   if (connections.has(sessionId)) {
@@ -93,6 +94,7 @@ function deliverMcpResponse(sessionId, response, res) {
   }
 
   return res.status(200).json(response);
+
 }
 
 app.use(cors());
@@ -169,12 +171,14 @@ app.post('/sse', async (req, res) => {
       return delivery;
     }
 
+
     const result = await sendChatmiRequest(
       sessionId,
       mcpRequest.method,
       mcpRequest.params || {},
       mcpRequest.id
     );
+
 
     if (mcpRequest.method === 'tools/list') {
       toolsListCache.data = result;
