@@ -195,24 +195,77 @@ async function sendChatmiRequest(
   return result;
 }
 
-async function warmToolsList(sessionId) {
-  try {
-    warmupLogger.info('Refreshing tools list cache', { sessionId });
-    const result = await sendChatmiRequest(
-      sessionId,
-      'tools/list',
-      {},
-      'warm-tools-list',
-      { requestId: `warm-${sessionId}` }
-    );
-    chatmiToolsListCache.data = result;
-    chatmiToolsListCache.timestamp = Date.now();
-    warmupLogger.info('Tools list cache updated', {
-      cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString()
-    });
-  } catch (error) {
-    warmupLogger.error('Failed to refresh tools list cache', error);
+let warmToolsListPromise = null;
+let warmToolsListCooldownUntil = 0;
+const WARMUP_COOLDOWN_MS = 10_000;
+
+async function warmToolsList(sessionId, reason) {
+  warmupLogger.info('Refreshing tools list cache', { sessionId, reason });
+  const result = await sendChatmiRequest(
+    sessionId,
+    'tools/list',
+    {},
+    'warm-tools-list',
+    { requestId: `warm-${sessionId}` }
+  );
+  chatmiToolsListCache.data = result;
+  chatmiToolsListCache.timestamp = Date.now();
+  warmToolsListCooldownUntil = 0;
+  warmupLogger.info('Tools list cache updated', {
+    cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString(),
+    reason,
+    sessionId
+  });
+}
+
+function triggerWarmToolsList(sessionId, reason) {
+  if (isToolsListCacheValid()) {
+    warmupLogger.debug('Skipping warmup; cache still valid', { sessionId, reason });
+    return null;
   }
+
+  const now = Date.now();
+  if (now < warmToolsListCooldownUntil) {
+    warmupLogger.warn('Skipping warmup due to active cooldown', {
+      sessionId,
+      reason,
+      retryAt: new Date(warmToolsListCooldownUntil).toISOString()
+    });
+    return null;
+  }
+
+  if (warmToolsListPromise) {
+    warmupLogger.debug('Warmup already in progress', { sessionId, reason });
+    return warmToolsListPromise;
+  }
+
+  warmToolsListPromise = warmToolsList(sessionId, reason)
+    .catch((error) => {
+      const meta = {
+        sessionId,
+        reason,
+        error: error instanceof Error ? error.message : error
+      };
+      if (error instanceof Error && error.stack) {
+        meta.stack = error.stack;
+      }
+      warmupLogger.error('Failed to refresh tools list cache', meta);
+      if (error instanceof Error && /429/.test(error.message)) {
+        warmToolsListCooldownUntil = Date.now() + WARMUP_COOLDOWN_MS;
+        warmupLogger.warn('Entering warmup cooldown after rate limit', {
+          cooldownMs: WARMUP_COOLDOWN_MS,
+          retryAt: new Date(warmToolsListCooldownUntil).toISOString()
+        });
+      }
+      throw error;
+    })
+    .finally(() => {
+      warmToolsListPromise = null;
+    });
+
+  // Avoid unhandled rejection warnings for callers that don't await the promise.
+  warmToolsListPromise.catch(() => {});
+  return warmToolsListPromise;
 }
 
 function describeConnection(connection) {
@@ -327,7 +380,7 @@ app.get('/sse', async (req, res) => {
   logConnectionSnapshot();
 
   if (!isToolsListCacheValid()) {
-    warmToolsList(sessionId);
+    triggerWarmToolsList(sessionId, 'sse-connection');
   }
 
   // Keep-alive
@@ -398,7 +451,7 @@ app.post('/sse', async (req, res) => {
       };
 
       const delivery = deliverMcpResponse(sessionId, cachedResponse, res);
-      warmToolsList(sessionId);
+      triggerWarmToolsList(sessionId, 'serve-cached-tools-list');
       return delivery;
     }
 
