@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,6 +10,31 @@ const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT ||
   'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
 const connections = new Map();
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const extractSessionId = req =>
+  req.query.sessionId || req.query.session || req.headers['x-session-id'];
+
+const ensureSessionId = (req, { createIfMissing = false, context = 'session' } = {}) => {
+  const provided = extractSessionId(req);
+
+  if (provided) {
+    if (UUID_REGEX.test(provided)) {
+      return provided;
+    }
+
+    console.warn(`[${context}] Ignoring non-UUID session id: ${provided}`);
+  }
+
+  if (!createIfMissing) {
+    return null;
+  }
+
+  const generated = randomUUID();
+  console.log(`[${context}] Generated new session id: ${generated}`);
+  return generated;
+};
 
 app.use(cors());
 app.use(express.json());
@@ -20,7 +46,10 @@ app.use(express.json());
 
 // SSE Connection Endpoint (GET)
 app.get('/sse', async (req, res) => {
-  const sessionId = req.query.session || `session-${Date.now()}`;
+  const sessionId = ensureSessionId(req, {
+    createIfMissing: true,
+    context: 'sse'
+  });
   
   console.log('='.repeat(80));
   console.log(`[SSE GET] New connection`);
@@ -38,56 +67,50 @@ app.get('/sse', async (req, res) => {
 
   // CRITICAL: Send endpoint event first!
   // This tells the client where to POST messages
-  const protocol = req.get('x-forwarded-proto') || 'https';
-  const host = req.get('host');
-  const endpointUrl = `${protocol}://${host}/sse`;
-  
-  const endpointEvent = {
-    jsonrpc: '2.0',
-    method: 'endpoint',
-    params: {
-      uri: endpointUrl
-    }
-  };
-  
-  console.log(`[SSE GET] Sending endpoint event:`, JSON.stringify(endpointEvent));
-  res.write(`data: ${JSON.stringify(endpointEvent)}\n\n`);
-  console.log(`[SSE GET] Endpoint event sent!`);
+  const fullUrl = new URL(`${req.protocol}://${req.get('host')}${req.originalUrl}`);
+  const messagePathname = fullUrl.pathname.replace(/\/[^/]*$/, '/message');
+  const messagePath = `${messagePathname}?sessionId=${encodeURIComponent(
+    sessionId
+  )}`;
 
-  // Keep-alive
-  const keepAliveInterval = setInterval(() => {
-    try {
-      res.write(':ping\n\n');
-    } catch (error) {
-      console.error(`[SSE GET] Keep-alive error:`, error);
-      clearInterval(keepAliveInterval);
-    }
-  }, 30000);
+  console.log(`[SSE GET] Sending endpoint path: ${messagePath}`);
+  res.write(`event: endpoint\ndata: ${messagePath}\n\n`);
+  console.log(`[SSE GET] Endpoint path sent!`);
 
   req.on('close', () => {
     console.log(`[SSE GET] Connection closed: ${sessionId}`);
-    clearInterval(keepAliveInterval);
     connections.delete(sessionId);
   });
 });
 
 // Message Endpoint (POST) - This is where client sends requests
-app.post('/sse', async (req, res) => {
+const handleMcpMessage = async (req, res) => {
   console.log('='.repeat(80));
-  console.log(`[SSE POST] Message received`);
-  console.log(`[SSE POST] Time: ${new Date().toISOString()}`);
-  console.log(`[SSE POST] Headers:`, JSON.stringify(req.headers, null, 2));
-  console.log(`[SSE POST] Body:`, JSON.stringify(req.body, null, 2));
-  
-  const sessionId = req.query.session || req.headers['x-session-id'] || 'default';
-  console.log(`[SSE POST] Session: ${sessionId}`);
-  
+  console.log(`[MCP POST] ${req.method} ${req.originalUrl}`);
+  console.log(`[MCP POST] Time: ${new Date().toISOString()}`);
+  console.log(`[MCP POST] Headers:`, JSON.stringify(req.headers, null, 2));
+  console.log(`[MCP POST] Body:`, JSON.stringify(req.body, null, 2));
+
+  const sessionId = ensureSessionId(req, { context: 'post' });
+  if (!sessionId) {
+    console.error('[MCP POST] Missing or invalid session id');
+    return res.status(400).json({
+      jsonrpc: '2.0',
+      id: req.body?.id || null,
+      error: {
+        code: -32602,
+        message: 'Missing or invalid sessionId (must be UUID)'
+      }
+    });
+  }
+  console.log(`[MCP POST] Session: ${sessionId}`);
+
   try {
     const mcpRequest = req.body;
 
     // Validate JSON-RPC
     if (!mcpRequest || mcpRequest.jsonrpc !== '2.0') {
-      console.error(`[SSE POST] Invalid JSON-RPC format`);
+      console.error(`[MCP POST] Invalid JSON-RPC format`);
       return res.status(400).json({
         jsonrpc: '2.0',
         id: mcpRequest?.id || null,
@@ -95,12 +118,12 @@ app.post('/sse', async (req, res) => {
       });
     }
 
-    console.log(`[SSE POST] Method: ${mcpRequest.method}`);
-    console.log(`[SSE POST] ID: ${mcpRequest.id}`);
+    console.log(`[MCP POST] Method: ${mcpRequest.method}`);
+    console.log(`[MCP POST] ID: ${mcpRequest.id}`);
 
     // Handle initialize specially
     if (mcpRequest.method === 'initialize') {
-      console.log(`[SSE POST] Handling initialize request`);
+      console.log(`[MCP POST] Handling initialize request`);
       const initResponse = {
         jsonrpc: '2.0',
         id: mcpRequest.id,
@@ -115,24 +138,24 @@ app.post('/sse', async (req, res) => {
           }
         }
       };
-      
-      console.log(`[SSE POST] Sending initialize response:`, JSON.stringify(initResponse, null, 2));
-      
+
+      console.log(`[MCP POST] Sending initialize response:`, JSON.stringify(initResponse, null, 2));
+
       // Check if client wants SSE response
       const acceptHeader = req.get('accept') || '';
       if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
-        console.log(`[SSE POST] Sending via SSE`);
+        console.log(`[MCP POST] Sending via SSE`);
         connections.get(sessionId).write(`data: ${JSON.stringify(initResponse)}\n\n`);
         return res.status(202).json({ status: 'sent via SSE' });
       }
-      
-      console.log(`[SSE POST] Sending via HTTP`);
+
+      console.log(`[MCP POST] Sending via HTTP`);
       return res.json(initResponse);
     }
 
     // For all other methods, forward to Chatmi
-    console.log(`[SSE POST] Forwarding to Chatmi...`);
-    
+    console.log(`[MCP POST] Forwarding to Chatmi...`);
+
     const inputString = JSON.stringify({
       method: mcpRequest.method,
       params: mcpRequest.params || {},
@@ -184,34 +207,37 @@ app.post('/sse', async (req, res) => {
       result
     };
 
-    console.log(`[SSE POST] MCP Response:`, JSON.stringify(mcpResponse, null, 2));
+    console.log(`[MCP POST] MCP Response:`, JSON.stringify(mcpResponse, null, 2));
 
     // Check if client wants SSE response
     const acceptHeader = req.get('accept') || '';
-    console.log(`[SSE POST] Accept header: ${acceptHeader}`);
-    
+    console.log(`[MCP POST] Accept header: ${acceptHeader}`);
+
     if (acceptHeader.includes('text/event-stream') && connections.has(sessionId)) {
-      console.log(`[SSE POST] Sending response via SSE to session: ${sessionId}`);
+      console.log(`[MCP POST] Sending response via SSE to session: ${sessionId}`);
       connections.get(sessionId).write(`data: ${JSON.stringify(mcpResponse)}\n\n`);
       return res.status(202).json({ status: 'sent via SSE', sessionId });
     }
 
-    console.log(`[SSE POST] Sending response via HTTP`);
+    console.log(`[MCP POST] Sending response via HTTP`);
     return res.json(mcpResponse);
-    
+
   } catch (error) {
-    console.error(`[SSE POST] Error:`, error);
-    console.error(`[SSE POST] Stack:`, error.stack);
+    console.error(`[MCP POST] Error:`, error);
+    console.error(`[MCP POST] Stack:`, error.stack);
     return res.status(500).json({
       jsonrpc: '2.0',
       id: req.body?.id || null,
-      error: { 
-        code: -32603, 
+      error: {
+        code: -32603,
         message: error.message
       }
     });
   }
-});
+};
+
+app.post('/sse', handleMcpMessage);
+app.post('/message', handleMcpMessage);
 
 app.get('/health', (req, res) => {
   res.json({ 
