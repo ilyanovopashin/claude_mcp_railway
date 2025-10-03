@@ -46,7 +46,7 @@ app.get('/sse', async (req, res) => {
   )}`;
 
   console.log(`[SSE GET] Sending endpoint path: ${messagePath}`);
-  res.write(`data: ${messagePath}\n\n`);
+  res.write(`event: endpoint\ndata: ${messagePath}\n\n`);
   console.log(`[SSE GET] Endpoint path sent!`);
 
   // Keep-alive
