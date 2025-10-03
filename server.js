@@ -6,8 +6,13 @@ const { randomUUID } = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT || 
-  'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
+const CHATMI_BASE_URL =
+  process.env.CHATMI_BASE_URL ||
+  'https://admin.chatme.ai/connector/webim/webim_message';
+const CHATMI_WEBHOOK_SUFFIX =
+  process.env.CHATMI_WEBHOOK_SUFFIX || 'bot_api_webhook';
+const CHATMI_FALLBACK_ENDPOINT = process.env.CHATMI_ENDPOINT ||
+  `${CHATMI_BASE_URL}/${CHATMI_WEBHOOK_SUFFIX}`;
 
 const connections = new Map();
 
@@ -45,6 +50,14 @@ app.use(express.json());
 // 3. Client uses that POST URL for all requests
 
 // SSE Connection Endpoint (GET)
+const buildChatmiEndpoint = routePrefix => {
+  if (routePrefix) {
+    return `${CHATMI_BASE_URL}/${routePrefix}/${CHATMI_WEBHOOK_SUFFIX}`;
+  }
+
+  return CHATMI_FALLBACK_ENDPOINT;
+};
+
 const sendSseEvent = (sessionId, event, data) => {
   const connection = connections.get(sessionId);
 
@@ -55,35 +68,60 @@ const sendSseEvent = (sessionId, event, data) => {
 
   const payload = typeof data === 'string' ? data : JSON.stringify(data);
   const eventLine = event ? `event: ${event}\n` : '';
-  connection.write(`${eventLine}data: ${payload}\n\n`);
+  connection.res.write(`${eventLine}data: ${payload}\n\n`);
   return true;
 };
 
-app.get('/sse', async (req, res) => {
+const getRoutePrefix = req => {
+  if (req.params) {
+    if (typeof req.params.channelId === 'string') {
+      return req.params.channelId;
+    }
+
+    if (typeof req.params[0] === 'string') {
+      return req.params[0];
+    }
+  }
+
+  const sessionId = extractSessionId(req);
+  if (sessionId) {
+    const connection = connections.get(sessionId);
+    if (connection?.routePrefix) {
+      return connection.routePrefix;
+    }
+  }
+
+  return '';
+};
+
+const handleSseConnection = async (req, res) => {
   const sessionId = ensureSessionId(req, {
     createIfMissing: true,
     context: 'sse'
   });
-  
+
+  const routePrefix = getRoutePrefix(req);
+
   console.log('='.repeat(80));
   console.log(`[SSE GET] New connection`);
   console.log(`[SSE GET] Session: ${sessionId}`);
   console.log(`[SSE GET] Time: ${new Date().toISOString()}`);
   console.log(`[SSE GET] Host: ${req.get('host')}`);
+  console.log(`[SSE GET] Route prefix: ${routePrefix || '(root)'}`);
+  console.log(`[SSE GET] Chatmi endpoint: ${buildChatmiEndpoint(routePrefix)}`);
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  connections.set(sessionId, res);
+  connections.set(sessionId, { res, routePrefix });
   console.log(`[SSE GET] Stored connection. Active: ${connections.size}`);
 
   // CRITICAL: Send endpoint event first!
   // This tells the client where to POST messages
-  const fullUrl = new URL(`${req.protocol}://${req.get('host')}${req.originalUrl}`);
-  const messagePathname = fullUrl.pathname.replace(/\/[^/]*$/, '/message');
-  const messagePath = `${messagePathname}?sessionId=${encodeURIComponent(
+  const basePath = routePrefix ? `/${routePrefix}` : '';
+  const messagePath = `${basePath}/message?sessionId=${encodeURIComponent(
     sessionId
   )}`;
 
@@ -95,7 +133,10 @@ app.get('/sse', async (req, res) => {
     console.log(`[SSE GET] Connection closed: ${sessionId}`);
     connections.delete(sessionId);
   });
-});
+};
+
+app.get('/sse', handleSseConnection);
+app.get('/:channelId/sse', handleSseConnection);
 
 // Message Endpoint (POST) - This is where client sends requests
 const handleMcpMessage = async (req, res) => {
@@ -117,7 +158,21 @@ const handleMcpMessage = async (req, res) => {
       }
     });
   }
+  const requestPrefix = getRoutePrefix(req);
+  const connection = connections.get(sessionId);
+  const connectionPrefix = connection?.routePrefix || '';
+  const routePrefix = requestPrefix || connectionPrefix;
+  const chatmiEndpoint = buildChatmiEndpoint(routePrefix);
+
+  if (requestPrefix && connectionPrefix && requestPrefix !== connectionPrefix) {
+    console.warn(
+      `[MCP POST] Route prefix mismatch. Request=${requestPrefix}, connection=${connectionPrefix}`
+    );
+  }
+
   console.log(`[MCP POST] Session: ${sessionId}`);
+  console.log(`[MCP POST] Route prefix: ${routePrefix || '(root)'}`);
+  console.log(`[MCP POST] Chatmi endpoint: ${chatmiEndpoint}`);
 
   try {
     const mcpRequest = req.body;
@@ -176,7 +231,7 @@ const handleMcpMessage = async (req, res) => {
 
     console.log(`[Chatmi] Request: ${inputString}`);
 
-    const chatmiResponse = await fetch(CHATMI_ENDPOINT, {
+    const chatmiResponse = await fetch(chatmiEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -224,7 +279,11 @@ const handleMcpMessage = async (req, res) => {
     // Check if client wants SSE response
     if (sendSseEvent(sessionId, 'message', mcpResponse)) {
       console.log(`[MCP POST] Response sent via SSE to session: ${sessionId}`);
-      return res.status(202).json({ status: 'sent via SSE', sessionId });
+      return res.status(202).json({
+        status: 'sent via SSE',
+        sessionId,
+        routePrefix
+      });
     }
 
     console.warn('[MCP POST] No SSE connection; falling back to HTTP response');
@@ -244,7 +303,11 @@ const handleMcpMessage = async (req, res) => {
 
     if (sendSseEvent(sessionId, 'error', errorResponse)) {
       console.log(`[MCP POST] Error sent via SSE to session: ${sessionId}`);
-      return res.status(202).json({ status: 'error sent via SSE', sessionId });
+      return res.status(202).json({
+        status: 'error sent via SSE',
+        sessionId,
+        routePrefix
+      });
     }
 
     return res.status(500).json(errorResponse);
@@ -253,13 +316,21 @@ const handleMcpMessage = async (req, res) => {
 
 app.post('/sse', handleMcpMessage);
 app.post('/message', handleMcpMessage);
+app.post('/:channelId/message', handleMcpMessage);
+
+const describeConnections = () =>
+  Array.from(connections.entries()).map(([sessionId, value]) => ({
+    sessionId,
+    routePrefix: value.routePrefix || null
+  }));
 
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     connections: connections.size,
-    sessions: Array.from(connections.keys()),
-    chatmi: CHATMI_ENDPOINT ? 'configured' : 'default',
+    sessions: describeConnections(),
+    chatmiBase: CHATMI_BASE_URL,
+    chatmiFallback: CHATMI_FALLBACK_ENDPOINT,
     timestamp: new Date().toISOString()
   });
 });
@@ -281,7 +352,7 @@ app.post('/test/chatmi', async (req, res) => {
     
     console.log('[Test] Sending:', testPayload);
     
-    const response = await fetch(CHATMI_ENDPOINT, {
+    const response = await fetch(CHATMI_FALLBACK_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(testPayload)
@@ -304,16 +375,16 @@ app.post('/test/chatmi', async (req, res) => {
     
     res.json({ 
       success: true,
-      chatmiEndpoint: CHATMI_ENDPOINT,
+      chatmiEndpoint: CHATMI_FALLBACK_ENDPOINT,
       rawResponse: data,
       parsedTools: parsedText
     });
   } catch (error) {
     console.error('[Test] Error:', error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: error.message,
-      chatmiEndpoint: CHATMI_ENDPOINT
+      chatmiEndpoint: CHATMI_FALLBACK_ENDPOINT
     });
   }
 });
@@ -327,6 +398,7 @@ app.listen(PORT, () => {
   console.log(`   - POST /sse  → Send MCP messages`);
   console.log(`❤️  Health: /health`);
   console.log(`🧪 Test: POST /test/chatmi`);
-  console.log(`🔧 Chatmi: ${CHATMI_ENDPOINT}`);
+  console.log(`🔧 Chatmi base: ${CHATMI_BASE_URL}`);
+  console.log(`   - Fallback endpoint: ${CHATMI_FALLBACK_ENDPOINT}`);
   console.log('='.repeat(80));
 });
