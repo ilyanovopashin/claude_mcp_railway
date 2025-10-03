@@ -83,14 +83,18 @@ async function warmToolsList(sessionId) {
 }
 
 function deliverMcpResponse(sessionId, response, res) {
+
+  const payload = JSON.stringify(response);
+
   if (connections.has(sessionId)) {
     console.log(`[MCP] Sending via SSE to session: ${sessionId}`);
-    connections.get(sessionId).write(`data: ${JSON.stringify(response)}\n\n`);
-    return res.status(202).json({ status: 'sent via SSE', sessionId });
+    connections.get(sessionId).write(`data: ${payload}\n\n`);
+  } else {
+    console.log(`[MCP] No SSE connection found for session: ${sessionId}`);
   }
 
-  console.log(`[MCP] No SSE connection, sending via HTTP`);
-  return res.json(response);
+  return res.status(200).json(response);
+
 }
 
 app.use(cors());
@@ -108,6 +112,9 @@ app.get('/sse', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
 
   connections.set(sessionId, res);
   console.log(`[SSE] Active connections: ${connections.size}`);
@@ -164,12 +171,14 @@ app.post('/sse', async (req, res) => {
       return delivery;
     }
 
+
     const result = await sendChatmiRequest(
       sessionId,
       mcpRequest.method,
       mcpRequest.params || {},
       mcpRequest.id
     );
+
 
     if (mcpRequest.method === 'tools/list') {
       toolsListCache.data = result;
