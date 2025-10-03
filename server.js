@@ -107,7 +107,6 @@ const CHATMI_ENDPOINT =
   process.env.CHATMI_ENDPOINT ||
   'https://admin.chatme.ai/connector/webim/webim_message/b453dc519e33a90c9ca6d3365445f3d3/bot_api_webhook';
 
-const warmupLogger = createLogger('Warmup');
 const sseLogger = createLogger('SSE');
 const mcpLogger = createLogger('MCP');
 const debugLogger = createLogger('Debug');
@@ -116,20 +115,7 @@ const testLogger = createLogger('Test');
 
 const connections = new Map();
 let lastConnectedSessionId = null;
-
-const chatmiToolsListCache = {
-  data: null,
-  timestamp: 0
-};
-
-const TOOLS_LIST_CACHE_TTL = 60 * 1000; // 1 minute cache TTL for tools list
-
-function isToolsListCacheValid() {
-  return (
-    chatmiToolsListCache.data !== null &&
-    Date.now() - chatmiToolsListCache.timestamp < TOOLS_LIST_CACHE_TTL
-  );
-}
+const MCP_PROTOCOL_VERSION = '2024-10-07';
 
 async function sendChatmiRequest(
   sessionId,
@@ -193,80 +179,6 @@ async function sendChatmiRequest(
   logger.info('Chatmi request completed', { resultType: typeof result });
 
   return result;
-}
-
-let warmToolsListPromise = null;
-let warmToolsListCooldownUntil = 0;
-const WARMUP_COOLDOWN_MS = 10_000;
-
-async function warmToolsList(sessionId, reason) {
-  warmupLogger.info('Refreshing tools list cache', { sessionId, reason });
-  const result = await sendChatmiRequest(
-    sessionId,
-    'tools/list',
-    {},
-    'warm-tools-list',
-    { requestId: `warm-${sessionId}` }
-  );
-  chatmiToolsListCache.data = result;
-  chatmiToolsListCache.timestamp = Date.now();
-  warmToolsListCooldownUntil = 0;
-  warmupLogger.info('Tools list cache updated', {
-    cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString(),
-    reason,
-    sessionId
-  });
-  deliverCachedToolsList(sessionId, { reason: reason || 'warm-tools-list-refresh' });
-}
-
-function triggerWarmToolsList(sessionId, reason) {
-  if (isToolsListCacheValid()) {
-    warmupLogger.debug('Skipping warmup; cache still valid', { sessionId, reason });
-    return null;
-  }
-
-  const now = Date.now();
-  if (now < warmToolsListCooldownUntil) {
-    warmupLogger.warn('Skipping warmup due to active cooldown', {
-      sessionId,
-      reason,
-      retryAt: new Date(warmToolsListCooldownUntil).toISOString()
-    });
-    return null;
-  }
-
-  if (warmToolsListPromise) {
-    warmupLogger.debug('Warmup already in progress', { sessionId, reason });
-    return warmToolsListPromise;
-  }
-
-  warmToolsListPromise = warmToolsList(sessionId, reason)
-    .catch((error) => {
-      const meta = {
-        sessionId,
-        reason,
-        error: error instanceof Error ? error.message : error
-      };
-      if (error instanceof Error && error.stack) {
-        meta.stack = error.stack;
-      }
-      warmupLogger.error('Failed to refresh tools list cache', meta);
-      if (error instanceof Error && /429/.test(error.message)) {
-        warmToolsListCooldownUntil = Date.now() + WARMUP_COOLDOWN_MS;
-        warmupLogger.warn('Entering warmup cooldown after rate limit', {
-          cooldownMs: WARMUP_COOLDOWN_MS,
-          retryAt: new Date(warmToolsListCooldownUntil).toISOString()
-        });
-      }
-      throw error;
-    })
-    .finally(() => {
-      warmToolsListPromise = null;
-    });
-
-  // Avoid unhandled rejection warnings for callers that don't await the promise.
-  warmToolsListPromise.catch(() => {});
-  return warmToolsListPromise;
 }
 
 function describeConnection(connection) {
@@ -340,47 +252,7 @@ function writeSsePayload(sessionId, payloadEnvelope, context = {}) {
   }
 }
 
-function deliverCachedToolsList(sessionId, context = {}) {
-  if (!isToolsListCacheValid()) {
-    mcpLogger.debug('Skipping cached tools list delivery; cache invalid', {
-      sessionId,
-      deliveryReason: context.reason
-    });
-    return;
-  }
-
-  const cachedResponse = {
-    jsonrpc: '2.0',
-    id: context.responseId || 'warm-tools-list',
-    result: chatmiToolsListCache.data
-  };
-  const payloadEnvelope = {
-    type: 'response',
-    response: cachedResponse
-  };
-
-  mcpLogger.info('Delivering cached tools list over SSE', {
-    sessionId,
-    requestMethod: 'tools/list',
-    deliveryReason: context.reason,
-    cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString()
-  });
-  mcpLogger.debug('Prepared cached tools list payload envelope', {
-    sessionId,
-    requestMethod: 'tools/list',
-    deliveryReason: context.reason,
-    responseId: cachedResponse.id,
-    payload: payloadEnvelope
-  });
-
-  writeSsePayload(sessionId, payloadEnvelope, {
-    requestMethod: 'tools/list',
-    responseId: cachedResponse.id,
-    deliveryReason: context.reason
-  });
-}
-
-function deliverMcpResponse(sessionId, response, res, context = {}) {
+function deliverMcpResponse(sessionId, response, res, context = {}, statusCode = 200) {
   const payloadEnvelope = {
     type: 'response',
     response
@@ -406,7 +278,7 @@ function deliverMcpResponse(sessionId, response, res, context = {}) {
     responseId: response.id,
     requestMethod: context.requestMethod
   });
-  return res.status(200).json(response);
+  return res.status(statusCode).json(response);
 }
 
 app.use(cors());
@@ -453,11 +325,21 @@ app.get('/sse', async (req, res) => {
   });
   logConnectionSnapshot();
 
-  if (!isToolsListCacheValid()) {
-    triggerWarmToolsList(sessionId, 'sse-connection');
-  } else {
-    deliverCachedToolsList(sessionId, { reason: 'sse-connection-cache' });
-  }
+  writeSsePayload(
+    sessionId,
+    {
+      type: 'session',
+      session: {
+        id: sessionId,
+        protocol: 'MCP',
+        protocolVersion: MCP_PROTOCOL_VERSION
+      }
+    },
+    {
+      requestMethod: 'session-start',
+      deliveryReason: 'sse-handshake'
+    }
+  );
 
   // Keep-alive
   const keepAliveInterval = setInterval(() => {
@@ -518,26 +400,6 @@ app.post('/sse', async (req, res) => {
       method: mcpRequest.method,
       params: mcpRequest.params
     });
-    if (mcpRequest.method === 'tools/list' && isToolsListCacheValid()) {
-      logger.info('Serving tools list from cache');
-      const cachedResponse = {
-        jsonrpc: '2.0',
-        id: mcpRequest.id,
-        result: chatmiToolsListCache.data
-      };
-
-      logger.info('Returning cached tools list to MCP client', {
-        sessionId,
-        toolCount: Array.isArray(chatmiToolsListCache.data?.tools)
-          ? chatmiToolsListCache.data.tools.length
-          : undefined
-      });
-      const delivery = deliverMcpResponse(sessionId, cachedResponse, res, {
-        requestMethod: mcpRequest.method
-      });
-      triggerWarmToolsList(sessionId, 'serve-cached-tools-list');
-      return delivery;
-    }
 
     const result = await sendChatmiRequest(
       sessionId,
@@ -546,18 +408,6 @@ app.post('/sse', async (req, res) => {
       mcpRequest.id,
       { requestId: req.headers['x-request-id'] }
     );
-
-    if (mcpRequest.method === 'tools/list') {
-      chatmiToolsListCache.data = result;
-      chatmiToolsListCache.timestamp = Date.now();
-      logger.info('Tools list cache updated from MCP response', {
-        cachedAt: new Date(chatmiToolsListCache.timestamp).toISOString()
-      });
-      logger.info('Returning tools list to MCP client', {
-        sessionId,
-        toolCount: Array.isArray(result?.tools) ? result.tools.length : undefined
-      });
-    }
 
     const mcpResponse = {
       jsonrpc: '2.0',
@@ -576,14 +426,22 @@ app.post('/sse', async (req, res) => {
 
   } catch (error) {
     logger.error('Failed to process MCP request', error);
-    return res.status(500).json({
+    const errorResponse = {
       jsonrpc: '2.0',
       id: req.body?.id || null,
       error: {
         code: -32603,
-        message: error.message
+        message: error instanceof Error ? error.message : String(error)
       }
-    });
+    };
+
+    return deliverMcpResponse(
+      sessionId,
+      errorResponse,
+      res,
+      { requestMethod: req.body?.method },
+      500
+    );
   }
 });
 
